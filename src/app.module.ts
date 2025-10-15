@@ -5,6 +5,7 @@ import { HealthModule } from './health/health.module';
 import { ConfigModule } from '@nestjs/config';
 import { EmbeddingsModule } from './embeddings/embeddings.module';
 import { QdrantModule } from './qdrant/qdrant.module';
+import { RagModule } from './rag/rag.module';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { QdrantModule } from './qdrant/qdrant.module';
     HealthModule,
     EmbeddingsModule,
     QdrantModule,
+    RagModule,
   ],
   controllers: [AppController],
   providers: [AppService],
