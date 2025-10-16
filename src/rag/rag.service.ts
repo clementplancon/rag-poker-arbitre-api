@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { EmbeddingsService } from '../embeddings/embeddings.service';
 import { QdrantService } from '../qdrant/qdrant.service';
 import { Mistral } from '@mistralai/mistralai';
+import { Evidence, selectEvidenceBySentence } from './evidence.selector';
 
 type Classified = { format: string[]; phase: string[] };
 
@@ -16,16 +17,6 @@ function getCompletionText(res: any): string {
   return '';
 }
 
-// “Doc hints” souples: on détecte des mentions et on applique un BOOST (pas de filtre dur)
-function inferSoftDocBoosts(q: string): Record<string, number> {
-  const text = q.toLowerCase();
-  const boosts: Record<string, number> = {};
-  if (/ropta/.test(text)) boosts['ROPTA-2025-02.pdf'] = 1.25;
-  if (/\btda\b/.test(text) || /tournament directors/.test(text))
-    boosts['reglement-et-legislation-poker.pdf'] = 1.15;
-  return boosts;
-}
-
 @Injectable()
 export class RagService {
   private chat: Mistral;
@@ -33,7 +24,7 @@ export class RagService {
 
   constructor(
     private readonly cfg: ConfigService,
-    private readonly emb: EmbeddingsService,
+    private readonly embeddings: EmbeddingsService,
     private readonly qd: QdrantService,
   ) {
     this.chat = new Mistral({
@@ -72,18 +63,14 @@ Réponds UNIQUEMENT ce JSON, sans commentaire. Si doute, liste vide.`;
 
   async retrieve(question: string, k = 12) {
     const cls = await this.classify(question);
-    const vec = (await this.emb.embedBatch([question]))[0];
-
-    // Boosts souples : jamais exclusifs
-    const docBoosts = inferSoftDocBoosts(question);
+    const vec = (await this.embeddings.embedBatch([question]))[0];
 
     const hits = await this.qd.smartSearch(vec, {
       kRaw: 40,
       kFinal: k,
       format: cls.format,
       phase: cls.phase,
-      boosts: {
-        docBoosts,
+      rescoring: {
         preferFormat: cls.format,
         preferPhase: cls.phase,
         freshness: true,
@@ -113,58 +100,68 @@ Réponds UNIQUEMENT ce JSON, sans commentaire. Si doute, liste vide.`;
     question: string,
     mode: 'debutant' | 'arbitre' = 'debutant',
     k = 12,
+    opts?: { history?: Array<{ role: 'user' | 'assistant'; content: string }> },
   ) {
     const { classified, contexts } = await this.retrieve(question, k);
 
-    // On garde la diversité obtenue par smartSearch, mais on tronque à k.
-    const used = contexts.slice(0, k);
-
-    const citations = used
-      .map(
-        (c, i) =>
-          `[${i + 1}] Doc: ${c.doc_id}, §${c.section || '-'}, p.${c.page_start}–${c.page_end}, v.${c.version}`,
-      )
-      .join('\n');
-    const contextText = used
-      .map((c, i) => `[#${i + 1}] (${c.doc_id}) ${c.text}`)
-      .join('\n\n');
-
     const sys =
       mode === 'debutant'
-        ? `Règles strictes:
-- Ne pas inventer.
-- Réponds en 4–8 lignes, français simple.
-- Si plusieurs règlements sont pertinents, structure la réponse par document (ex: ROPTA, TDA) et indique les différences éventuelles.
-- Utilise la version la plus récente indiquée dans les contextes.
-- Donne 2–4 citations en fin.`
-        : `Règles strictes (Arbitre):
-- Ne pas inventer. Réponse concise et structurée.
-- Si plusieurs règlements sont pertinents, compare-les brièvement, sections séparées par document.
-- Toujours citer précisément (Doc, section, pages, version), sans mélanger les docs.`;
+        ? `Tu es un assistant expert du poker.
+Tu réponds en français clair et précis, adapté au niveau du joueur, ici débutant ou amateur donc sois pédagogique et concret.
+Ne mentionne pas les documents ni les sources qui te sont données, mais ta réponse doit être exacte et cohérente en s'appuyant sur ceux-ci tout de même.
+Utilise un ton courtois, sans jargon complexe ou inutile. Si tu ne trouves pas la réponse dans les extraits de règlements, dis-le honnêtement mais n'invente pas de réponse. Si la question est hors sujet poker, répond poliment que tu es un assistant spécialisé en poker et ne peux pas répondre à cette question. Fais une réponse en 15 lignes maximum.`
+        : `Tu es un assistant expert du poker de tournoi.
+Tu réponds en français clair et précis, adapté au niveau du joueur, ici un expert ou arbitre donc donne la réponse la plus rigoureuse selon les point de règles qui te seront donnés.
+Ne mentionne pas les documents ni les sources qui te sont données, mais ta réponse doit être exacte et cohérente en s'appuyant sur ceux-ci tout de même.
+Utilise un ton professionnel. Si tu ne trouves pas la réponse dans les extraits de règlements, dis-le honnêtement mais n'invente pas de réponse. Si la question est hors sujet poker, répond poliment que tu es un assistant spécialisé en poker et ne peux pas répondre à cette question. Fais une réponse en 30 lignes maximum.`;
 
     const user = `
-Question: ${question}
-
-Catégorisation:
-format=${JSON.stringify(classified.format)} phase=${JSON.stringify(classified.phase)}
-
-CONTEXTES:
-${contextText}
-
-Citations (à utiliser en fin de réponse):
-${citations}
-`.trim();
+  Question:
+  ${question}
+  
+Voici des extraits des règlements pertinents :
+---
+${contexts.join('\n---\n')}
+---
+  `.trim();
 
     const res = await this.chat.chat.complete({
       model: this.chatModel,
-      temperature: 0.2,
       messages: [
-        { role: 'system', content: sys },
-        { role: 'user', content: user },
+        {
+          role: 'system',
+          content: sys,
+        },
+        {
+          role: 'user',
+          content: user,
+        },
       ],
+      temperature: 0.2,
     });
 
-    const text = getCompletionText(res).trim();
-    return { text, contexts: used, classified };
+    // 3) Extraction texte robuste
+    let text = '';
+    const choice: any = res?.choices?.[0];
+    const msg = choice?.message;
+
+    if (typeof msg?.content === 'string') {
+      text = msg.content;
+    } else if (Array.isArray(msg?.content)) {
+      // certains SDK renvoient un tableau de fragments
+      text = msg.content.map((c: any) => c?.text ?? c ?? '').join('');
+    } else if (typeof (res as any)?.output_text === 'string') {
+      // compat ancien helper
+      text = (res as any).output_text;
+    }
+
+    // 4) Usage (tokens) — plusieurs variantes possibles selon versions du SDK
+    const usage =
+      (res as any)?.usage ?? // { prompt_tokens, completion_tokens, total_tokens }
+      (res as any)?.meta?.usage ?? // d’autres libellae possibles
+      null;
+    console.log('USAGE', usage);
+
+    return { text, usage };
   }
 }

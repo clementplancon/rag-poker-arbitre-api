@@ -29,6 +29,22 @@ function parseArgs() {
   return out;
 }
 
+// util: déduire une "section" (titre/règle) depuis le texte du chunk
+function detectSection(t: string): string {
+  const lines = t
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // ROPTA/TDA patterns fréquents
+  const hit =
+    lines.find((l) => /^r[èe]gle\s*\d+(:|\s|–|-)/i.test(l)) ||
+    lines.find((l) =>
+      /^(string|mise|relance|action|p[ée]nalit[é|e]|proc[ée]dure)/i.test(l),
+    ) ||
+    lines.find((l) => l === l.toUpperCase() && l.length > 8 && l.length < 120); // titre en capitales
+  return hit ? hit.replace(/\s+/g, ' ').slice(0, 140) : '';
+}
+
 async function extractPages(
   buf: Buffer,
 ): Promise<{ pages: string[]; info: any }> {
@@ -57,6 +73,28 @@ function sha256(buf: Buffer): string {
   const h = createHash('sha256');
   h.update(buf);
   return `sha256:${h.digest('hex')}`;
+}
+
+// ID numériques déterministes pour Qdrant (compat JS, ≤ 2^53-1)
+function fnv1a32(str: string): number {
+  let h = 0x811c9dc5; // offset basis
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0; // *16777619
+  }
+  return h >>> 0; // uint32
+}
+
+/**
+ * Construit un entier unique et stable à partir de (docId, chunkIndex).
+ * Schéma : (hash32(docId) << 16) | (chunkIndex & 0xFFFF)
+ * -> jusqu'à 65k chunks par doc, plenty pour nos PDFs.
+ */
+function makePointId(docId: string, chunkIndex: number): number {
+  const hi = fnv1a32(docId) & 0xffff_ffff;
+  const lo = chunkIndex & 0xffff;
+  // on reste < 2^53-1 (safe integer JS)
+  return hi * 65536 + lo;
 }
 
 async function bootstrap() {
@@ -100,7 +138,6 @@ async function bootstrap() {
   // Embeddings par batch raisonnable
   const BATCH = 32;
   let total = 0;
-  let seqId = 1;
 
   for (let i = 0; i < chunks.length; i += BATCH) {
     const slice = chunks.slice(i, i + BATCH);
@@ -126,15 +163,14 @@ async function bootstrap() {
     }
 
     const points = slice.map((c, j) => {
-      const id = seqId++; // entier unique
       return {
-        id,
+        id: makePointId(docId, c.chunk_index),
         vector: vectors[j],
         payload: {
           text: c.text,
           doc_id: docId,
           title,
-          section: '',
+          section: detectSection(c.text), // ✅ section renseignée
           page_start: c.page_start,
           page_end: c.page_end,
           format,
